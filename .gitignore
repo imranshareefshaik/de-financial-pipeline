@@ -1,0 +1,14 @@
+# Python virtual environments & bytecode
+__pycache__/
+*.py[cod]
+.venv/
+env/
+.env
+
+# IDE & OS specific
+.vscode/
+.DS_Store
+
+# Pipeline raw data outputs
+data/raw/*
+data/processed/*
