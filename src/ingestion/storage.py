@@ -54,3 +54,17 @@ class LocalStorageHandler:
         df = pd.DataFrame(records)
         df.to_parquet(file_path, index=False, engine="pyarrow")
         return str(file_path)
+if __name__ == "__main__":
+    import logging
+    from src.ingestion.api_client import APIClient
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    
+    # Fetch live market data
+    client = APIClient()
+    market_data = client.get_market_data(per_page=10)
+
+    # Save to partitioned raw directory
+    storage = LocalStorageHandler()
+    saved_path = storage.save(market_data, filename="crypto_markets.parquet")
+    print(f"Data successfully saved to: {saved_path}")
