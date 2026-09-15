@@ -12,6 +12,7 @@ from src.transformation.clean_data import DataCleaner
 from src.transformation.aggregate_metrics import MetricsAggregator
 from src.transformation.db_loader import DatabaseLoader
 from src.transformation.spark_session import PySparkManager
+from src.quality.validator import DataQualityValidator, DataQualityError
 from src.utils.config_loader import load_config
 
 logging.basicConfig(
@@ -22,14 +23,14 @@ logger = logging.getLogger("PipelineRunner")
 
 
 def run_pipeline(config_path: str = "config/pipeline_config.yaml") -> None:
-    """Executes the financial data pipeline driven by YAML configuration."""
+    """Executes financial data pipeline with integrated Data Quality gates."""
     start_time = time.time()
     cfg = load_config(config_path)
     logger.info(f"Loaded pipeline configuration for environment: {cfg['app']['environment']}")
 
     try:
         # Stage 1: Ingestion
-        logger.info("Stage 1/4: Ingesting raw crypto market data...")
+        logger.info("Stage 1/5: Ingesting raw crypto market data...")
         client = APIClient(base_url=cfg["ingestion"]["base_url"])
         raw_data = client.get_market_data(
             vs_currency=cfg["ingestion"]["vs_currency"],
@@ -41,21 +42,34 @@ def run_pipeline(config_path: str = "config/pipeline_config.yaml") -> None:
         logger.info(f"Stage 1 complete. Saved raw data to: {raw_file_path}")
 
         # Stage 2: Data Cleaning via PySpark
-        logger.info("Stage 2/4: Cleaning raw Parquet data...")
+        logger.info("Stage 2/5: Cleaning raw Parquet data...")
         cleaner = DataCleaner()
         cleaned_path = cfg["transformation"]["processed_storage_path"]
-        cleaner.clean_market_data(raw_file_path, cleaned_path)
+        cleaned_df = cleaner.clean_market_data(raw_file_path, cleaned_path)
         logger.info(f"Stage 2 complete. Cleaned data at: {cleaned_path}")
 
-        # Stage 3: Aggregations & Volatility Metrics
-        logger.info("Stage 3/4: Computing market analytics and tier aggregations...")
+        # Stage 3: Data Quality Gate (Circuit Breaker)
+        logger.info("Stage 3/5: Running Data Quality audit...")
+        spark = PySparkManager.get_spark_session()
+        persisted_cleaned_df = spark.read.parquet(cleaned_path)
+        
+        validator = DataQualityValidator(persisted_cleaned_df, dataset_name="CleanedMarketData")
+        validator.run_all(
+            primary_key="coin_id",
+            required_cols=["coin_id", "symbol"],
+            positive_cols=["current_price"]
+        )
+        logger.info("Stage 3 complete. Data quality gates verified.")
+
+        # Stage 4: Aggregations & Volatility Metrics
+        logger.info("Stage 4/5: Computing market analytics and tier aggregations...")
         aggregator = MetricsAggregator()
         analytics_path = cfg["transformation"]["analytics_storage_path"]
         aggregator.compute_market_summary(cleaned_path, analytics_path)
-        logger.info(f"Stage 3 complete. Analytics data at: {analytics_path}")
+        logger.info(f"Stage 4 complete. Analytics data at: {analytics_path}")
 
-        # Stage 4: Loading into Database Warehouse
-        logger.info("Stage 4/4: Loading curated analytics into warehouse...")
+        # Stage 5: Loading into Database Warehouse
+        logger.info("Stage 5/5: Loading curated analytics into warehouse...")
         db_path = Path(__file__).resolve().parents[1] / cfg["warehouse"]["db_path"]
         db_url = f"sqlite:///{db_path}"
         loader = DatabaseLoader(db_url=db_url)
@@ -63,11 +77,14 @@ def run_pipeline(config_path: str = "config/pipeline_config.yaml") -> None:
             analytics_path,
             table_name=cfg["warehouse"]["table_name"]
         )
-        logger.info(f"Stage 4 complete. Successfully loaded {rows_loaded} rows into table '{cfg['warehouse']['table_name']}'.")
+        logger.info(f"Stage 5 complete. Successfully loaded {rows_loaded} rows into '{cfg['warehouse']['table_name']}'.")
 
         elapsed = round(time.time() - start_time, 2)
-        logger.info(f"Pipeline executed successfully in {elapsed}s.")
+        logger.info(f"Pipeline executed successfully with all quality gates in {elapsed}s.")
 
+    except DataQualityError as dqe:
+        logger.critical(f"PIPELINE HALTED BY QUALITY GATE: {dqe}")
+        raise
     except Exception as e:
         logger.error(f"Pipeline execution failed: {e}", exc_info=True)
         raise
