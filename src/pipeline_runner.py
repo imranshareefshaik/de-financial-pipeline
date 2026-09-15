@@ -1,7 +1,9 @@
+import argparse
 import logging
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -13,6 +15,7 @@ from src.transformation.aggregate_metrics import MetricsAggregator
 from src.transformation.db_loader import DatabaseLoader
 from src.transformation.spark_session import PySparkManager
 from src.quality.validator import DataQualityValidator, DataQualityError
+from src.warehouse.analytics_views import WarehouseViewManager
 from src.utils.config_loader import load_config
 
 logging.basicConfig(
@@ -22,54 +25,67 @@ logging.basicConfig(
 logger = logging.getLogger("PipelineRunner")
 
 
-def run_pipeline(config_path: str = "config/pipeline_config.yaml") -> None:
-    """Executes financial data pipeline with integrated Data Quality gates."""
+def run_pipeline(
+    config_path: str = "config/pipeline_config.yaml",
+    limit_override: Optional[int] = None,
+    skip_ingestion: bool = False
+) -> None:
+    """Executes financial data pipeline with CLI overrides and quality controls."""
     start_time = time.time()
     cfg = load_config(config_path)
-    logger.info(f"Loaded pipeline configuration for environment: {cfg['app']['environment']}")
+    per_page = limit_override or cfg["ingestion"]["per_page"]
+    logger.info(f"Loaded pipeline configuration (limit={per_page}, skip_ingestion={skip_ingestion})")
+
+    storage = LocalStorageHandler(base_path=cfg["ingestion"]["raw_storage_path"])
 
     try:
         # Stage 1: Ingestion
-        logger.info("Stage 1/5: Ingesting raw crypto market data...")
-        client = APIClient(base_url=cfg["ingestion"]["base_url"])
-        raw_data = client.get_market_data(
-            vs_currency=cfg["ingestion"]["vs_currency"],
-            per_page=cfg["ingestion"]["per_page"]
-        )
-
-        storage = LocalStorageHandler(base_path=cfg["ingestion"]["raw_storage_path"])
-        raw_file_path = storage.save(raw_data, filename="crypto_markets.parquet")
-        logger.info(f"Stage 1 complete. Saved raw data to: {raw_file_path}")
+        if not skip_ingestion:
+            logger.info("Stage 1/6: Ingesting raw crypto market data from API...")
+            client = APIClient(base_url=cfg["ingestion"]["base_url"])
+            raw_data = client.get_market_data(
+                vs_currency=cfg["ingestion"]["vs_currency"],
+                per_page=per_page
+            )
+            raw_file_path = storage.save(raw_data, filename="crypto_markets.parquet")
+            logger.info(f"Stage 1 complete. Saved raw data to: {raw_file_path}")
+        else:
+            logger.info("Stage 1/6: Skipped ingestion. Locating most recent raw Parquet file...")
+            raw_files = sorted(list(Path(cfg["ingestion"]["raw_storage_path"]).glob("**/*.parquet")))
+            if not raw_files:
+                raise FileNotFoundError("No existing raw Parquet files found to backfill.")
+            raw_file_path = str(raw_files[-1])
+            logger.info(f"Using raw file: {raw_file_path}")
 
         # Stage 2: Data Cleaning via PySpark
-        logger.info("Stage 2/5: Cleaning raw Parquet data...")
+        logger.info("Stage 2/6: Cleaning raw Parquet data...")
         cleaner = DataCleaner()
         cleaned_path = cfg["transformation"]["processed_storage_path"]
-        cleaned_df = cleaner.clean_market_data(raw_file_path, cleaned_path)
+        cleaner.clean_market_data(raw_file_path, cleaned_path)
         logger.info(f"Stage 2 complete. Cleaned data at: {cleaned_path}")
 
-        # Stage 3: Data Quality Gate (Circuit Breaker)
-        logger.info("Stage 3/5: Running Data Quality audit...")
+        # Stage 3: Data Quality Gate
+        logger.info("Stage 3/6: Running Data Quality audit...")
         spark = PySparkManager.get_spark_session()
-        persisted_cleaned_df = spark.read.parquet(cleaned_path)
+        persisted_df = spark.read.parquet(cleaned_path)
         
-        validator = DataQualityValidator(persisted_cleaned_df, dataset_name="CleanedMarketData")
+        validator = DataQualityValidator(persisted_df, dataset_name="CleanedMarketData")
         validator.run_all(
             primary_key="coin_id",
             required_cols=["coin_id", "symbol"],
             positive_cols=["current_price"]
         )
-        logger.info("Stage 3 complete. Data quality gates verified.")
+        logger.info("Stage 3 complete. Data quality verified.")
 
         # Stage 4: Aggregations & Volatility Metrics
-        logger.info("Stage 4/5: Computing market analytics and tier aggregations...")
+        logger.info("Stage 4/6: Computing market analytics and tier aggregations...")
         aggregator = MetricsAggregator()
         analytics_path = cfg["transformation"]["analytics_storage_path"]
         aggregator.compute_market_summary(cleaned_path, analytics_path)
         logger.info(f"Stage 4 complete. Analytics data at: {analytics_path}")
 
         # Stage 5: Loading into Database Warehouse
-        logger.info("Stage 5/5: Loading curated analytics into warehouse...")
+        logger.info("Stage 5/6: Loading curated analytics into warehouse...")
         db_path = Path(__file__).resolve().parents[1] / cfg["warehouse"]["db_path"]
         db_url = f"sqlite:///{db_path}"
         loader = DatabaseLoader(db_url=db_url)
@@ -77,10 +93,16 @@ def run_pipeline(config_path: str = "config/pipeline_config.yaml") -> None:
             analytics_path,
             table_name=cfg["warehouse"]["table_name"]
         )
-        logger.info(f"Stage 5 complete. Successfully loaded {rows_loaded} rows into '{cfg['warehouse']['table_name']}'.")
+        logger.info(f"Stage 5 complete. Loaded {rows_loaded} rows into table '{cfg['warehouse']['table_name']}'.")
+
+        # Stage 6: Refresh Analytical Views
+        logger.info("Stage 6/6: Refreshing SQL analytics views and data marts...")
+        view_manager = WarehouseViewManager(db_url=db_url)
+        view_manager.create_views()
+        logger.info("Stage 6 complete. Analytical views synchronized.")
 
         elapsed = round(time.time() - start_time, 2)
-        logger.info(f"Pipeline executed successfully with all quality gates in {elapsed}s.")
+        logger.info(f"Pipeline executed successfully in {elapsed}s.")
 
     except DataQualityError as dqe:
         logger.critical(f"PIPELINE HALTED BY QUALITY GATE: {dqe}")
@@ -93,4 +115,14 @@ def run_pipeline(config_path: str = "config/pipeline_config.yaml") -> None:
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser(description="End-to-End Financial Data Engineering Pipeline")
+    parser.add_argument("--config", type=str, default="config/pipeline_config.yaml", help="Path to pipeline YAML config")
+    parser.add_argument("--limit", type=int, default=None, help="Override ingestion asset count")
+    parser.add_argument("--skip-ingestion", action="store_true", help="Bypass API call and process latest raw Parquet partition")
+
+    args = parser.parse_args()
+    run_pipeline(
+        config_path=args.config,
+        limit_override=args.limit,
+        skip_ingestion=args.skip_ingestion
+    )
