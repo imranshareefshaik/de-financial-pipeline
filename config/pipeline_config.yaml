@@ -1,0 +1,20 @@
+app:
+  name: "DE-Financial-Pipeline"
+  environment: "local"
+
+ingestion:
+  base_url: "https://api.coingecko.com/api/v3"
+  vs_currency: "usd"
+  per_page: 25
+  raw_storage_path: "data/raw"
+
+transformation:
+  processed_storage_path: "data/processed/crypto_markets_cleaned.parquet"
+  analytics_storage_path: "data/analytics/crypto_market_summary.parquet"
+  spark:
+    driver_memory: "2g"
+    shuffle_partitions: 4
+
+warehouse:
+  table_name: "crypto_market_summary"
+  db_path: "data/financial_warehouse.db"
