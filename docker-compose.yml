@@ -1,0 +1,11 @@
+services:
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: de_financial_pipeline
+    volumes:
+      # Mount data folder to persist Parquet and SQLite outputs on the host
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
