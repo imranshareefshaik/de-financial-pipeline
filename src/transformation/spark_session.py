@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Optional
 from pyspark.sql import SparkSession
 
-# Point Hadoop to local binaries
+# Bind Spark workers to current virtual environment python
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
 hadoop_home = str(Path.home() / "hadoop")
 if Path(hadoop_home).exists():
     os.environ["HADOOP_HOME"] = hadoop_home
@@ -23,7 +26,7 @@ class PySparkManager:
     @classmethod
     def get_spark_session(cls, app_name: str = "DE-Financial-Pipeline") -> SparkSession:
         if cls._instance is None:
-            logger.info("Initializing new PySpark Session...")
+            logger.info("Initializing PySpark Session...")
             try:
                 cls._instance = (
                     SparkSession.builder
@@ -32,8 +35,8 @@ class PySparkManager:
                     .config("spark.driver.memory", "2g")
                     .config("spark.sql.execution.arrow.pyspark.enabled", "true")
                     .config("spark.sql.shuffle.partitions", "4")
-                    # Bypass POSIX permissions issues on Windows local filesystem
                     .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem")
+                    .config("spark.sql.pyspark.jvm.enabled", "false")
                     .getOrCreate()
                 )
                 logger.info(f"PySpark Session '{app_name}' initialized successfully.")

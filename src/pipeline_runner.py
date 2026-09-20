@@ -3,7 +3,6 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -17,6 +16,7 @@ from src.transformation.spark_session import PySparkManager
 from src.quality.validator import DataQualityValidator, DataQualityError
 from src.warehouse.analytics_views import WarehouseViewManager
 from src.utils.config_loader import load_config
+from src.utils.audit_logger import PipelineAuditLogger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,16 +27,18 @@ logger = logging.getLogger("PipelineRunner")
 
 def run_pipeline(
     config_path: str = "config/pipeline_config.yaml",
-    limit_override: Optional[int] = None,
+    limit_override: int = None,
     skip_ingestion: bool = False
 ) -> None:
-    """Executes financial data pipeline with CLI overrides and quality controls."""
+    """Executes financial data pipeline with audit logging and quality gates."""
     start_time = time.time()
     cfg = load_config(config_path)
     per_page = limit_override or cfg["ingestion"]["per_page"]
     logger.info(f"Loaded pipeline configuration (limit={per_page}, skip_ingestion={skip_ingestion})")
 
     storage = LocalStorageHandler(base_path=cfg["ingestion"]["raw_storage_path"])
+    audit_logger = PipelineAuditLogger()
+    rows_loaded = 0
 
     try:
         # Stage 1: Ingestion
@@ -104,10 +106,22 @@ def run_pipeline(
         elapsed = round(time.time() - start_time, 2)
         logger.info(f"Pipeline executed successfully in {elapsed}s.")
 
-    except DataQualityError as dqe:
-        logger.critical(f"PIPELINE HALTED BY QUALITY GATE: {dqe}")
-        raise
+        audit_logger.log_run(
+            pipeline_name=cfg["app"]["name"],
+            status="SUCCESS",
+            records_ingested=rows_loaded,
+            duration_seconds=elapsed
+        )
+
     except Exception as e:
+        elapsed = round(time.time() - start_time, 2)
+        audit_logger.log_run(
+            pipeline_name=cfg["app"]["name"],
+            status="FAILED",
+            records_ingested=rows_loaded,
+            duration_seconds=elapsed,
+            error_message=str(e)
+        )
         logger.error(f"Pipeline execution failed: {e}", exc_info=True)
         raise
     finally:
