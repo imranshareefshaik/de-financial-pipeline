@@ -17,6 +17,7 @@ from src.quality.validator import DataQualityValidator, DataQualityError
 from src.warehouse.analytics_views import WarehouseViewManager
 from src.utils.config_loader import load_config
 from src.utils.audit_logger import PipelineAuditLogger
+from src.utils.notifier import PipelineNotifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,7 @@ def run_pipeline(
     limit_override: int = None,
     skip_ingestion: bool = False
 ) -> None:
-    """Executes financial data pipeline with audit logging and quality gates."""
+    """Executes financial data pipeline with audit logging, quality gates, and alerting."""
     start_time = time.time()
     cfg = load_config(config_path)
     per_page = limit_override or cfg["ingestion"]["per_page"]
@@ -38,10 +39,13 @@ def run_pipeline(
 
     storage = LocalStorageHandler(base_path=cfg["ingestion"]["raw_storage_path"])
     audit_logger = PipelineAuditLogger()
+    notifier = PipelineNotifier()
     rows_loaded = 0
+    current_stage = "Initialization"
 
     try:
         # Stage 1: Ingestion
+        current_stage = "Stage 1: Ingestion"
         if not skip_ingestion:
             logger.info("Stage 1/6: Ingesting raw crypto market data from API...")
             client = APIClient(base_url=cfg["ingestion"]["base_url"])
@@ -60,6 +64,7 @@ def run_pipeline(
             logger.info(f"Using raw file: {raw_file_path}")
 
         # Stage 2: Data Cleaning via PySpark
+        current_stage = "Stage 2: Data Cleaning"
         logger.info("Stage 2/6: Cleaning raw Parquet data...")
         cleaner = DataCleaner()
         cleaned_path = cfg["transformation"]["processed_storage_path"]
@@ -67,6 +72,7 @@ def run_pipeline(
         logger.info(f"Stage 2 complete. Cleaned data at: {cleaned_path}")
 
         # Stage 3: Data Quality Gate
+        current_stage = "Stage 3: Data Quality Gate"
         logger.info("Stage 3/6: Running Data Quality audit...")
         spark = PySparkManager.get_spark_session()
         persisted_df = spark.read.parquet(cleaned_path)
@@ -80,6 +86,7 @@ def run_pipeline(
         logger.info("Stage 3 complete. Data quality verified.")
 
         # Stage 4: Aggregations & Volatility Metrics
+        current_stage = "Stage 4: Analytics Aggregations"
         logger.info("Stage 4/6: Computing market analytics and tier aggregations...")
         aggregator = MetricsAggregator()
         analytics_path = cfg["transformation"]["analytics_storage_path"]
@@ -87,6 +94,7 @@ def run_pipeline(
         logger.info(f"Stage 4 complete. Analytics data at: {analytics_path}")
 
         # Stage 5: Loading into Database Warehouse
+        current_stage = "Stage 5: Warehouse Loading"
         logger.info("Stage 5/6: Loading curated analytics into warehouse...")
         db_path = Path(__file__).resolve().parents[1] / cfg["warehouse"]["db_path"]
         db_url = f"sqlite:///{db_path}"
@@ -98,6 +106,7 @@ def run_pipeline(
         logger.info(f"Stage 5 complete. Loaded {rows_loaded} rows into table '{cfg['warehouse']['table_name']}'.")
 
         # Stage 6: Refresh Analytical Views
+        current_stage = "Stage 6: View Synchronization"
         logger.info("Stage 6/6: Refreshing SQL analytics views and data marts...")
         view_manager = WarehouseViewManager(db_url=db_url)
         view_manager.create_views()
@@ -106,12 +115,19 @@ def run_pipeline(
         elapsed = round(time.time() - start_time, 2)
         logger.info(f"Pipeline executed successfully in {elapsed}s.")
 
+        # Audit & Notification
         audit_logger.log_run(
             pipeline_name=cfg["app"]["name"],
             status="SUCCESS",
             records_ingested=rows_loaded,
             duration_seconds=elapsed
         )
+        notifier.notify_success({
+            "pipeline_name": cfg["app"]["name"],
+            "records_ingested": rows_loaded,
+            "duration_seconds": elapsed,
+            "environment": cfg["app"].get("environment", "local")
+        })
 
     except Exception as e:
         elapsed = round(time.time() - start_time, 2)
@@ -122,7 +138,12 @@ def run_pipeline(
             duration_seconds=elapsed,
             error_message=str(e)
         )
-        logger.error(f"Pipeline execution failed: {e}", exc_info=True)
+        notifier.notify_failure(
+            error_message=str(e),
+            stage=current_stage,
+            run_metrics={"duration_seconds": elapsed}
+        )
+        logger.error(f"Pipeline execution failed at '{current_stage}': {e}", exc_info=True)
         raise
     finally:
         PySparkManager.stop_session()
