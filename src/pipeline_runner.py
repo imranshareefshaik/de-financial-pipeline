@@ -19,6 +19,7 @@ from src.warehouse.analytics_views import WarehouseViewManager
 from src.utils.config_loader import load_config
 from src.utils.audit_logger import PipelineAuditLogger
 from src.utils.notifier import PipelineNotifier
+from src.utils.lineage_tracker import LineageTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +33,7 @@ def run_pipeline(
     limit_override: int = None,
     skip_ingestion: bool = False
 ) -> None:
-    """Executes financial data pipeline with audit logging, quality gates, drift checks, and alerting."""
+    """Executes financial data pipeline with governance, lineage, drift auditing, and alerting."""
     start_time = time.time()
     cfg = load_config(config_path)
     per_page = limit_override or cfg["ingestion"]["per_page"]
@@ -41,6 +42,7 @@ def run_pipeline(
     storage = LocalStorageHandler(base_path=cfg["ingestion"]["raw_storage_path"])
     audit_logger = PipelineAuditLogger()
     notifier = PipelineNotifier()
+    lineage_tracker = LineageTracker()
     rows_loaded = 0
     current_stage = "Initialization"
 
@@ -70,14 +72,23 @@ def run_pipeline(
         cleaner = DataCleaner()
         cleaned_path = cfg["transformation"]["processed_storage_path"]
         cleaner.clean_market_data(raw_file_path, cleaned_path)
+        
+        spark = PySparkManager.get_spark_session()
+        persisted_df = spark.read.parquet(cleaned_path)
+        
+        lineage_tracker.detect_schema_drift("Stage2_DataCleaning", persisted_df)
+        lineage_tracker.record_lineage(
+            stage_name="Stage2_DataCleaning",
+            inputs=[raw_file_path],
+            outputs=[cleaned_path],
+            schema_snapshot={field.name: str(field.dataType) for field in persisted_df.schema.fields},
+            record_count=persisted_df.count()
+        )
         logger.info(f"Stage 2 complete. Cleaned data at: {cleaned_path}")
 
         # Stage 3: Data Quality Gate
         current_stage = "Stage 3: Data Quality Gate"
         logger.info("Stage 3/7: Running Data Quality audit...")
-        spark = PySparkManager.get_spark_session()
-        persisted_df = spark.read.parquet(cleaned_path)
-        
         validator = DataQualityValidator(persisted_df, dataset_name="CleanedMarketData")
         validator.run_all(
             primary_key="coin_id",
@@ -92,14 +103,21 @@ def run_pipeline(
         aggregator = MetricsAggregator()
         analytics_path = cfg["transformation"]["analytics_storage_path"]
         aggregator.compute_market_summary(cleaned_path, analytics_path)
+        
+        analytics_df = spark.read.parquet(analytics_path)
+        lineage_tracker.record_lineage(
+            stage_name="Stage4_AnalyticsAggregations",
+            inputs=[cleaned_path],
+            outputs=[analytics_path],
+            schema_snapshot={field.name: str(field.dataType) for field in analytics_df.schema.fields},
+            record_count=analytics_df.count()
+        )
         logger.info(f"Stage 4 complete. Analytics data at: {analytics_path}")
 
         # Stage 5: Statistical Data Drift Detection
         current_stage = "Stage 5: Drift Detection"
         logger.info("Stage 5/7: Inspecting metrics for statistical data drift...")
-        analytics_df = spark.read.parquet(analytics_path)
         drift_detector = StatisticalDriftDetector(analytics_df, max_price_drift_pct=75.0)
-        # Using a conservative baseline based on top cryptocurrency historical averages
         baseline_stats = {"avg_price": 8000.0, "avg_volatility": 4.5}
         drift_detector.check_drift_against_baseline(baseline_stats)
         logger.info("Stage 5 complete. No critical drift detected.")
