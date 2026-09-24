@@ -16,7 +16,7 @@ if Path(hadoop_home).exists():
     if hadoop_bin not in os.environ.get("PATH", ""):
         os.environ["PATH"] = f"{hadoop_bin};{os.environ.get('PATH', '')}"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -26,7 +26,7 @@ class PySparkManager:
     @classmethod
     def get_spark_session(cls, app_name: str = "DE-Financial-Pipeline") -> SparkSession:
         if cls._instance is None:
-            logger.info("Initializing PySpark Session...")
+            logger.info("Initializing PySpark Session with AQE & Query Tuning...")
             try:
                 cls._instance = (
                     SparkSession.builder
@@ -36,7 +36,10 @@ class PySparkManager:
                     .config("spark.sql.execution.arrow.pyspark.enabled", "true")
                     .config("spark.sql.shuffle.partitions", "4")
                     .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem")
-                    .config("spark.sql.pyspark.jvm.enabled", "false")
+                    # Adaptive Query Execution (AQE) Optimizations
+                    .config("spark.sql.adaptive.enabled", "true")
+                    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+                    .config("spark.sql.autoBroadcastJoinThreshold", "10485760")  # 10MB auto-broadcast
                     .getOrCreate()
                 )
                 logger.info(f"PySpark Session '{app_name}' initialized successfully.")
